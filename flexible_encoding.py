@@ -23,28 +23,11 @@ import torch.utils.data as data
 from torch.nn import functional as F
 from torch.optim import SGD, Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
-
-# setting global variables below
-batch_size=50 # number of samples per batch for training
-num_words=500 # total number of words in the vocabulary
-emb_dim=50 # dimensionality of word embeddings
-num_lags=3 # number of time lags in electrode data
-EPOCHS = 5 # how many times are all the data points iterated through
-
-
-electrode=5  #which electrode are we considering
-taking_words=False  # are we taking the actual words or the lags around the last word
-lag_number=3 # how many previous lags/words to consider
-lags=[0,50,100] # only valid if taking word is false and should equal to the lagn_number
-train_num=3500 # 
-subject=798 # which subject is being tested
-min_num_words=5 # filter the other senctences
-audio_set=True # if taking into account audio onset and offset
-
+# NOTE, having trouble with torchsummary import
 
 
 def load_pickle(file_path): # loads object from a pickle file
-    
+
     # opens the file and creates an objects list to hold objects
     pickle_file = open(file_path, "rb")
     objects = []
@@ -56,6 +39,7 @@ def load_pickle(file_path): # loads object from a pickle file
         except EOFError:
             break
 
+    # returns the object from the pickle file
     pickle_file.close()
     first = objects[0]
     return first
@@ -82,7 +66,7 @@ def get_elec_id(subject):  # gets the IDs for each of the electrodes
 
     return elec_id
 
-def create_dataframe(subject): # creates the dataframe from the encoding data
+def create_dataframe(subject, min_num_words): # creates the dataframe from the encoding data
 
     # reads the final electrode decoding data into dataframe df
     path = "/scratch/gpfs/arnab/247_data_read/decoding_df_" + str(subject) + "_final.csv"
@@ -145,16 +129,15 @@ def get_elec_data(subject, df, ecogs, conv_name, all_onsets, lags, elec_id, lag_
         onsets=[]
         Y_data= np.zeros((elec_num, len(lags)))    
 
+        # for each lag adjust the lag amount, then add each onset
         for i in lags:
-
             lag_amount = int(i/ 1000 * 512)
-
             onsets.append(np.minimum(
                 t - half_window - 1,
                 np.maximum(half_window + 1,
                             np.round(all_onsets[-1]) + lag_amount)))
     
-    # converting the ondets into np array
+    # converting the onsets into np array
     index_onsets=np.asarray(onsets)
 
     # for loop looping through each electrode
@@ -182,10 +165,10 @@ def get_elec_data(subject, df, ecogs, conv_name, all_onsets, lags, elec_id, lag_
     return Y_data
 
 
-def prepare_emb_electrode(df, ecogs, subject, elec_id): # preparing the electrode_data and embeddings
+def prepare_emb_electrode(subject, elec_id, min_num_words, lag_number, lags, taking_words, emb_dim): # preparing the electrode_data and embeddings
 
     # preparing the arrays holding the embeddings and onsets
-    df = create_dataframe(subject)
+    df = create_dataframe(subject, min_num_words)
     embeddings = df.embeddings.values
     all_onsets = df.all_onsets.values
 
@@ -208,15 +191,16 @@ def prepare_emb_electrode(df, ecogs, subject, elec_id): # preparing the electrod
         onsets_current = df_current.all_onsets.values
         ecogs_current = all_ecog(elec_id, conv_name,subject)
     
+        # loop through each of the conversations
         for k in range(len(onsets_current)): 
-            conv_name=df.conversation_name.values[k]
+            conv_name = df.conversation_name.values[k]
             onset = onsets_current[k]
 
             # if statement checking if there are enough data points in onset, and that the last onset occurs before end of ECOG recording
             if len(onset)>= lag_number and onset[-1] < len(ecogs_current[:,0]):
 
                 # getting the electrode data, then adding it to the list of total data
-                current_elec_data = get_elec_data(subject, df, ecogs_current, conv_name, x, lags, elec_id, lag_number, taking_words)
+                current_elec_data = get_elec_data(subject, df, ecogs_current, conv_name, all_onsets, lags, elec_id, lag_number, taking_words)
                 electrode_data[p,:,:] = current_elec_data 
                 embeddings.append(embeddings_current[k])
                 p = p + 1
@@ -233,10 +217,10 @@ def prepare_emb_electrode(df, ecogs, subject, elec_id): # preparing the electrod
     # returning embeddings and electrode_data
     return embeddings, electrode_data
 
-def prepare_train_test(df, ecogs, subject, elec_id, train_num, batch_size, electrode): # creating the train and test splits and loaders
+def prepare_train_test(subject, elec_id, train_num, batch_size, electrode, min_num_words, lag_number, lags, taking_words, emb_dim): # creating the train and test splits and loaders
     
     # using the above prepare_emb_electrode method for data
-    embeddings, electrode_data = prepare_emb_electrode(df, ecogs, subject, elec_id)
+    embeddings, electrode_data = prepare_emb_electrode(subject, elec_id, min_num_words, lag_number, lags, taking_words, emb_dim)
 
     # getting data for a specific electrode
     elec_data = electrode_data[:,electrode,:]
@@ -245,11 +229,11 @@ def prepare_train_test(df, ecogs, subject, elec_id, train_num, batch_size, elect
     elec_data = np.expand_dims(elec_data, axis=1)
 
     # create the train test split for X and y
-    X_train=torch.from_numpy(embeddings[:train_num,:,:])
-    y_train=torch.from_numpy(elec_data[:train_num,:,:])
+    X_train = torch.from_numpy(embeddings[:train_num,:,:])
+    y_train = torch.from_numpy(elec_data[:train_num,:,:])
 
-    X_test=torch.from_numpy(embeddings[train_num:,:,:])
-    y_test=torch.from_numpy(elec_data[train_num:,:,:])
+    X_test = torch.from_numpy(embeddings[train_num:,:,:])
+    y_test = torch.from_numpy(elec_data[train_num:,:,:])
 
     # create the train and test set and loaders from the data
     trainset = torch.utils.data.TensorDataset(X_train, y_train)
@@ -260,100 +244,197 @@ def prepare_train_test(df, ecogs, subject, elec_id, train_num, batch_size, elect
 
     return trainset, trainloader, testset, testloader
 
+# create the flexible encoding model
 class flex_encoding(nn.Module):
-    def __init__(self, emb_dim, num_lags):
+    def __init__(self, emb_dim, num_lags, hidden_layer_dim, hidden_layer_num, lag_number, use_two_networks):
         super().__init__()
-        self.fc1 = nn.Linear(emb_dim, num_lags)
-    
-    def forward(self, x):
-        
-        y_pred= (self.fc1(x))        
-        return y_pred,v
-    
+        self.emb_dim = emb_dim
+        self.num_lags = num_lags
+        self.hidden_layer_dim = hidden_layer_dim
+        self.hidden_layer_num = hidden_layer_num
+        self.lag_number = lag_number
+        self.use_two_networks = use_two_networks
 
-def bdot(a, b):  
-    B = a.shape[0]
-    S = a.shape[2]
-    return torch.bmm(a.view(B, 1, S), b.view(B, S, 1)).reshape(-1)
+        # this is the structure for one-layered simple linear regression
+        self.one_layer = nn.Linear(emb_dim, 1)
 
+        # this is the structure for a hidden layered regression
+        self.input_layer = nn.Linear(emb_dim, hidden_layer_dim)
+        self.hidden_layer = nn.Linear(hidden_layer_dim, hidden_layer_dim)
+        self.output_layer = nn.Linear(hidden_layer_dim, 1)
+
+        # this is the structure for the softmax strategy that finds the best electrode
+        self.lag_layer = nn.Linear(emb_dim, lag_number)
+
+        # setting up the activation function
+        self.activation = nn.ReLU()
+
+def forward(self, x): # defining the forward propagation for the model
+
+    # check if there are any hidden layers in this situation
+    if (self.hidden_layer_num > 0):
+        # pass through the original input layer
+        x = self.activation(self.input_layer(x)) 
+        # pass through the hidden layers
+        for i in range(self.hidden_layer_num): 
+            x = self.activation(self.hidden_layer(x))
+        # pass through the final output layer
+        x = self.activation(self.output_layer(x))
+    
+    # if there are no hidden layers, simply pass forward through linear regression
+    x = self.activation(self.one_layer(x))
+
+    # extend to the include the number of lags in the result
+    y_pred = torch.repeat_interleave(x, self.lag_number, dim=-1)
+
+    # check if the second network is being used for the softmax operation
+    if (self.use_two_networks):
+        softmax_result = nn.Softmax(dim=1)(self.lag_layer(x))
+        return y_pred, softmax_result
+   
+    # solely return the prediction
+    else:
+        return y_pred
+
+# do a batch dot product between a and b, resulting in an vector of size B  
+def bdot(a, b):
+    # the first element of the list is the batch size, while the second is vector size  
+    B = a.shape[0] 
+    S = a.shape[2] 
+    # calculate the batch matrix product and combine into one array
+    return torch.bmm(a.view(B, 1, S), b.view(B, S, 1)).reshape(-1) 
+
+# this is the loss function definition module, which also contains a variable for if two networks are being used
 class CustomLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, second_network):
         super(CustomLoss, self).__init__()
+        self.second_network = second_network
 
-    def forward(self, y_pred, v, targets):
-        mse_error = torch.square(targets-y_pred)
-        loss=bdot(v, mse_error)
-        return loss.mean()  
-    
+    def forward(self, y_pred, targets, v = []):
+        # if there is a second network, batch dot product the softmaxed values and the error
+        if self.second_network: 
+            mse_error = torch.square(targets - y_pred)
+            loss = bdot(v, mse_error)
+            return loss.mean()
+        
+        # if there is no second network, simply take the minimum of all the losses
+        else:
+            subtracted_errors = targets - y_pred
+            return min(subtracted_errors)
 
-
-
-
-
-def train_one_epoch(epoch_index):
+def train_one_epoch(epoch_index, model, trainloader, optimizer, device, loss_fn, use_second_network): # conduct one epoch of model training
+    # declare the average and running losses
     running_loss = 0.
-    last_loss = 0.
-    
-    # Here, we use enumerate(training_loader) instead of
-    # iter(training_loader) so that we can track the batch
-    # index and do some intra-epoch reporting
+    output_loss = 0.
+
+    # loops through the trainloader and access each training pair one by one
     for batch_idx, batch in enumerate(trainloader):
-        # Every data instance is an input + label pair
-        x,y=batch
+
+        # separate the training pair into input and output
+        x, y = batch
     
-        # Zero your gradients for every batch!
+        # zero out/reset the gradients for each batch
         optimizer.zero_grad()
     
-        # Make predictions for this batch
+        # for both x and y, convert to a 32-bit floating point format, then send to the computing device
         x = x.to(torch.float32)
         x = x.to(device)
         y = y.to(torch.float32)
         y = y.to(device)
-        [output1,output2]=model(x)
-    
-        # Compute the loss and its gradients
-        loss = loss_fn(output1,output2, y)
+
+        # depending on if the second network is being used, feed into the loss function
+        if use_second_network:
+            [output1, output2] = model(x)
+            loss = loss_fn(output1, output2, y) 
+        else:
+            output1 = model(x)
+            loss = loss_fn(output1, y) 
+        
+        # compute the gradients for the model based on loss
         loss.backward()
     
-        # Adjust learning weights
+        # adjust learning weights in the model
         optimizer.step()
     
-        # Gather data and report
+        # get the total amount of loss, and add it to running total
         running_loss += loss.item()
 
-    last_loss = running_loss / (batch_idx+1) # loss per batch
-    print('epoch {} loss: {}'.format(epoch_index, last_loss))
+    # calculate the average loss for this batch
+    output_loss = running_loss / (batch_idx + 1) 
+    print('epoch {} loss: {}'.format(epoch_index, output_loss))
             
-    return last_loss
-
-# below is the training loop for the model
-for epoch in range(EPOCHS):
-    print('EPOCH {}:'.format(epoch + 1))
-
-    # Make sure gradient tracking is on, and do a pass over the data
-    model.train(True)
-    avg_loss = train_one_epoch(epoch)
+    return output_loss
 
 
-    running_vloss = 0.0
-    # Set the model to evaluation mode, disabling dropout and using population
-    # statistics for batch normalization.
-    model.eval()
+def train_model(EPOCHS, model, testloader, device, loss_fn, use_second_network): # training the model
+    # loop through the number of epochs
+    for epoch in range(EPOCHS):
+        print("EPOCH{}: ".format(epoch + 1))
 
-    # Disable gradient computation and reduce memory consumption.
-    with torch.no_grad():
-        for i, vdata in enumerate(testloader):
-            vinputs, vlabels = vdata
-            vinputs = vinputs.to(torch.float32)
-            vinputs = vinputs.to(device)
-            vlabels = vlabels.to(torch.float32)
-            vlabels = vlabels.to(device)
-            [output1,output2]=model(vinputs)
-            voutputs = model(vinputs)
-            vloss = loss_fn(output1,output2, vlabels)
-            running_vloss += vloss
+        # put the model on training mode, and train for one epoch
+        model.train(True)
+        training_loss = train_one_epoch(epoch)
 
-    avg_vloss = running_vloss / (i + 1)
-    print('LOSS train {} valid {}'.format(avg_loss, avg_vloss))
+        # start counter for validation loss
+        running_val_loss = 0.0
+
+        # set the model to evaluation mode
+        model.eval()
+
+        # disable gradient computation and memory consumption
+        with torch.no_grad():
+            # loop through each validation data point
+            for i, val_data in enumerate(testloader):
+                    # separate validation x and y
+                    val_x, val_y = val_data
+                    # send them to device and change to 32 bit floats
+                    val_x = val_x.to(torch.float32)
+                    val_x = val_x.to(device)
+                    val_y = val_y.to(torch.float32)
+                    val_y = val_y.to(device)
+
+                    # feed to model and loss function depending on whether two networks are being used
+                    if use_second_network:
+                        [output1, output2]=model(val_x)
+                        val_loss = loss_fn(output1, output2, val_y)
+                    else:
+                        output1 = model(val_x)
+                        val_loss = loss_fn(output1, val_y)
+            
+            # update running validation loss
+            running_val_loss += val_loss
+
+    avg_val_loss = running_val_loss / (i + 1)
+    print('LOSS train {} valid {}'.format(training_loss, avg_val_loss))
+
+def flexible_encoding(batch_size, num_words, emb_dim, num_lags, EPOCHS, hidden_layer_dim,
+                      hidden_layer_num, use_two_networks, electrode, taking_words,
+                      lag_number, lags, train_num, subject, min_num_words, audio_set):
+
+    elec_id = get_elec_id(subject)
+    trainset, trainloader, testset, testloader = prepare_train_test(subject, elec_id, train_num, batch_size, electrode, min_num_words, lag_number, lags, taking_words, emb_dim)
+
+    
+    
 
 
+
+'''
+batch_size=50 # number of samples per batch for training
+num_words=500 # total number of words in the vocabulary
+emb_dim=50 # dimensionality of word embeddings
+num_lags=3 # number of time lags in electrode data
+EPOCHS = 5 # how many times are all the data points iterated through
+hidden_layer_dim = 5 # how many dimensions per hidden layer in the network
+hidden_layer_num = 3 # how many total hidden layers are there
+use_two_networks = False # if we are using the second pass which checks the best lag value using softmax
+
+electrode=5  #which electrode are we considering
+taking_words=False  # are we taking the actual words or the lags around the last word
+lag_number=3 # how many previous lags/words to consider
+lags=[0,50,100] # only valid if taking word is false and should equal to the lagn_number
+train_num=3500 # 
+subject=798 # which subject is being tested
+min_num_words=5 # filter the other senctences
+audio_set=True # if taking into account audio onset and offset
+'''
