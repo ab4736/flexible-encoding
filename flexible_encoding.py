@@ -106,8 +106,6 @@ def all_ecog(conv_name, subject): # returns all the ECOG data for a given conver
         
     # create a numpy array of ecog data
     ecogs = np.asarray(ecogs).T
-    print(ecogs)
-
     return ecogs
 
 def get_elec_data(subject, df, ecogs, conv_name, all_onsets, lags, elec_id, lag_number,taking_words=True): # extract onset signal data from the electrodes
@@ -127,7 +125,7 @@ def get_elec_data(subject, df, ecogs, conv_name, all_onsets, lags, elec_id, lag_
     # if not, then use sliding window formula to set the onsets
     else: 
         onsets=[]
-        Y_data= np.zeros((elec_num, len(lags)))    
+        Y_data = np.zeros((elec_num, len(lags)))    
 
         # for each lag adjust the lag amount, then add each onset
         for i in lags:
@@ -183,13 +181,14 @@ def prepare_emb_electrode(subject, elec_id, min_num_words, lag_number, lags, tak
 
     # declaring embeddings
     embeddings = []
+    p = 0
 
     # loop through each conversation and update the dataframe, embeddings, onset, and ecog values
     for conv_name in conv_names:
         df_current = df[df.conversation_name==conv_name]
         embeddings_current = df_current.embeddings.values
         onsets_current = df_current.all_onsets.values
-        ecogs_current = all_ecog(elec_id, conv_name,subject)
+        ecogs_current = all_ecog(conv_name,subject)
     
         # loop through each of the conversations
         for k in range(len(onsets_current)): 
@@ -200,7 +199,7 @@ def prepare_emb_electrode(subject, elec_id, min_num_words, lag_number, lags, tak
             if len(onset)>= lag_number and onset[-1] < len(ecogs_current[:,0]):
 
                 # getting the electrode data, then adding it to the list of total data
-                current_elec_data = get_elec_data(subject, df, ecogs_current, conv_name, all_onsets, lags, elec_id, lag_number, taking_words)
+                current_elec_data = get_elec_data(subject, df, ecogs_current, conv_name, onset, lags, elec_id, lag_number, taking_words)
                 electrode_data[p,:,:] = current_elec_data 
                 embeddings.append(embeddings_current[k])
                 p = p + 1
@@ -269,32 +268,33 @@ class flex_encoding(nn.Module):
         # setting up the activation function
         self.activation = nn.ReLU()
 
-def forward(self, x): # defining the forward propagation for the model
+    def forward(self, x): # defining the forward propagation for the model
 
-    # check if there are any hidden layers in this situation
-    if (self.hidden_layer_num > 0):
-        # pass through the original input layer
-        x = self.activation(self.input_layer(x)) 
-        # pass through the hidden layers
-        for i in range(self.hidden_layer_num): 
-            x = self.activation(self.hidden_layer(x))
-        # pass through the final output layer
-        x = self.activation(self.output_layer(x))
+        # check if there are any hidden layers in this situation
+        if (self.hidden_layer_num > 0):
+            # pass through the original input layer
+            x = self.activation(self.input_layer(x)) 
+            # pass through the hidden layers
+            for i in range(self.hidden_layer_num): 
+                x = self.activation(self.hidden_layer(x))
+            # pass through the final output layer
+            x = self.activation(self.output_layer(x))
+
+        else: 
+            # if there are no hidden layers, simply pass forward through linear regression
+            x = self.activation(self.one_layer(x))
+
+        # extend to the include the number of lags in the result
+        y_pred = torch.repeat_interleave(x, self.lag_number, dim=-1)
+
+        # check if the second network is being used for the softmax operation
+        if (self.use_two_networks):
+            softmax_result = nn.Softmax(dim=1)(self.lag_layer(x))
+            return y_pred, softmax_result
     
-    # if there are no hidden layers, simply pass forward through linear regression
-    x = self.activation(self.one_layer(x))
-
-    # extend to the include the number of lags in the result
-    y_pred = torch.repeat_interleave(x, self.lag_number, dim=-1)
-
-    # check if the second network is being used for the softmax operation
-    if (self.use_two_networks):
-        softmax_result = nn.Softmax(dim=1)(self.lag_layer(x))
-        return y_pred, softmax_result
-   
-    # solely return the prediction
-    else:
-        return y_pred
+        # solely return the prediction
+        else:
+            return y_pred
 
 # do a batch dot product between a and b, resulting in an vector of size B  
 def bdot(a, b):
@@ -322,7 +322,7 @@ class CustomLoss(nn.Module):
             subtracted_errors = targets - y_pred
             return min(subtracted_errors)
 
-def train_one_epoch(epoch_index, model, trainloader, optimizer, device, loss_fn, use_second_network): # conduct one epoch of model training
+def train_one_epoch(epoch_index, model, trainloader, optimizer, device, use_second_network): # conduct one epoch of model training
     # declare the average and running losses
     running_loss = 0.
     output_loss = 0.
@@ -343,6 +343,7 @@ def train_one_epoch(epoch_index, model, trainloader, optimizer, device, loss_fn,
         y = y.to(device)
 
         # depending on if the second network is being used, feed into the loss function
+        loss_fn = CustomLoss(use_second_network)
         if use_second_network:
             [output1, output2] = model(x)
             loss = loss_fn(output1, output2, y) 
@@ -366,14 +367,14 @@ def train_one_epoch(epoch_index, model, trainloader, optimizer, device, loss_fn,
     return output_loss
 
 
-def train_model(EPOCHS, model, testloader, device, loss_fn, use_second_network): # training the model
+def train_model(EPOCHS, model, trainloader, optimizer, device, loss_fn, use_second_network): # training the model
     # loop through the number of epochs
     for epoch in range(EPOCHS):
         print("EPOCH{}: ".format(epoch + 1))
 
         # put the model on training mode, and train for one epoch
         model.train(True)
-        training_loss = train_one_epoch(epoch)
+        training_loss = train_one_epoch(epoch, model, trainloader, optimizer, device, loss_fn, use_second_network)
 
         # start counter for validation loss
         running_val_loss = 0.0
@@ -412,14 +413,15 @@ def flexible_encoding(batch_size, num_words, emb_dim, num_lags, EPOCHS, hidden_l
                       lag_number, lags, train_num, subject, min_num_words, audio_set):
 
     elec_id = get_elec_id(subject)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = flex_encoding(emb_dim, num_lags, hidden_layer_dim, hidden_layer_num, lag_number, use_two_networks)
+    model = model.to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
     trainset, trainloader, testset, testloader = prepare_train_test(subject, elec_id, train_num, batch_size, electrode, min_num_words, lag_number, lags, taking_words, emb_dim)
-
-    
-    
+    train_model(EPOCHS, model, trainloader, optimizer, device, use_two_networks)
 
 
 
-'''
 batch_size=50 # number of samples per batch for training
 num_words=500 # total number of words in the vocabulary
 emb_dim=50 # dimensionality of word embeddings
@@ -437,4 +439,23 @@ train_num=3500 #
 subject=798 # which subject is being tested
 min_num_words=5 # filter the other senctences
 audio_set=True # if taking into account audio onset and offset
-'''
+
+flexible_encoding(batch_size = batch_size, num_words = num_words, emb_dim = emb_dim, num_lags = num_lags,
+                  EPOCHS = EPOCHS, hidden_layer_dim = hidden_layer_dim, hidden_layer_num = hidden_layer_num,
+                  use_two_networks = use_two_networks, electrode = electrode, taking_words = taking_words,
+                  lag_number = lag_number, lags = lags, train_num = train_num, subject = subject, 
+                  min_num_words = min_num_words, audio_set = audio_set)
+
+
+
+    
+    
+
+
+
+
+
+
+
+# do window lags for the full sentence length, treating production/perception differently
+# perception + production keep the brain data (onset of sentence till 2 seconds after)
